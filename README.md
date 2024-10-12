@@ -1,4 +1,4 @@
-# SeisFusion
+# TEMrwkv
 this is the code implementation of "[Semi-Airborne Transient Electromagnetic Signal Denoising With Disentangled Representation Learning And RWKV](https://github.com/WAL-l/AEM_Denoise)"
 
 # Train

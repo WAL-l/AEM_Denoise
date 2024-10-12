@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 # @Time    : 2024/9/12 19:06
 # @Author  : Ws
-# @File    : AEMv1.py
+# @File    : TEMrwkv.py
 # @Software: PyCharm
 
 import math
 import torch
 import torch.nn as nn
-from mmcv.cnn.bricks.transformer import PatchEmbed
 from torch.utils.cpp_extension import load
 
 T_MAX = 8192
@@ -81,64 +80,37 @@ def RUN_CUDA(B, T, C, w, u, k, v):
     return WKV.apply(B, T, C, w.cuda(), u.cuda(), k.cuda(), v.cuda())
 
 
-# class DensePatchEmbed(nn.Module):
-#
-#     def __init__(
-#             self,
-#             signal_size: int = 224,
-#             patch_size: int = 16,
-#             in_chans: int = 3,
-#             embed_dim: int = 768,
-#             bias: bool = True,
-#     ):
-#         super().__init__()
-#         self.patch_size = patch_size
-#         self.kernel_size = 2*patch_size-1
-#         if signal_size is not None:
-#             self.signal_size = signal_size
-#             self.grid_size = tuple([s // p for s, p in zip(self.signal_size, self.patch_size)])
-#             self.num_patches = self.grid_size[0] * self.grid_size[1]
-#         else:
-#             self.signal_size = None
-#             self.grid_size = None
-#             self.num_patches = None
-#
-#         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=self.kernel_size, stride=patch_size, bias=bias)
-#         self.norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
-#
-#     def forward(self, x):
-#         B, C, H, W = x.shape
-#         pad_h = (self.kernel_size - H % self.kernel_size) % self.kernel_size
-#         pad_w = (self.kernel_size - W % self.kernel_size) % self.kernel_size
-#         x = F.pad(x, (0, pad_w, 0, pad_h))
-#         x = self.proj(x)
-#         x = x.flatten(2).transpose(1, 2)  # NCHW -> NLC
-#         return self.norm(x)
+class CoverEmbed(nn.Module):
+
+    def __init__(
+            self,
+            patch_size: int = 2,
+            in_chans: int = 1,
+            embed_dim: int = 768,
+            bias: bool = True,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.kernel_size = 2 * patch_size - 1
+        self.in_chans = in_chans
+        self.embed_dims = embed_dim
+        self.proj = nn.Conv1d(in_chans, embed_dim // 2, kernel_size=self.kernel_size, stride=1, bias=bias,
+                              padding='same')
+        self.norm = nn.LayerNorm(embed_dim // 2, elementwise_affine=False, eps=1e-6)
+        self.act = nn.GELU()
+        self.n1 = nn.Linear(embed_dim // 2, self.embed_dims)
+        # self.n2 = nn.Linear(self.embed_dims, self.embed_dims)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.act(self.proj(x))
+        x = x.permute(0, 2, 1)
+        x = self.n1(self.norm(x))
+        return x
 
 
-def q_shift(input, shift_pixel=1, gamma=1 / 4, patch_resolution=None):
-    assert gamma <= 1 / 4
-    B, N, C = input.shape
-    input = input.transpose(1, 2).reshape(B, C, patch_resolution[0], patch_resolution[1])
-    B, C, H, W = input.shape
-    output = torch.zeros_like(input)
-    output[:, 0:int(C * gamma), :, shift_pixel:W] = input[:, 0:int(C * gamma), :, 0:W - shift_pixel]
-    output[:, int(C * gamma):int(C * gamma * 2), :, 0:W - shift_pixel] = input[:, int(C * gamma):int(C * gamma * 2), :,
-                                                                         shift_pixel:W]
-    output[:, int(C * gamma * 2):int(C * gamma * 3), shift_pixel:H, :] = input[:, int(C * gamma * 2):int(C * gamma * 3),
-                                                                         0:H - shift_pixel, :]
-    output[:, int(C * gamma * 3):int(C * gamma * 4), 0:H - shift_pixel, :] = input[:,
-                                                                             int(C * gamma * 3):int(C * gamma * 4),
-                                                                             shift_pixel:H, :]
-    output[:, int(C * gamma * 4):, ...] = input[:, int(C * gamma * 4):, ...]
-    return output.flatten(2).transpose(1, 2)
-
-
-
-
-class VRWKV_SpatialMix(nn.Module):
-    def __init__(self, n_embd, n_layer, layer_id, shift_mode='q_shift',
-                 channel_gamma=1 / 4, shift_pixel=1, init_mode='fancy',
+class TEMRWKV_SignalMix(nn.Module):
+    def __init__(self, n_embd, n_layer, layer_id, init_mode='fancy',
                  key_norm=False):
         super().__init__()
         self.layer_id = layer_id
@@ -147,15 +119,8 @@ class VRWKV_SpatialMix(nn.Module):
         self.device = None
         attn_sz = n_embd
         self._init_weights(init_mode)
-        self.shift_pixel = shift_pixel
-        self.shift_mode = shift_mode
-        if shift_pixel > 0:
-            self.shift_func = eval(shift_mode)
-            self.channel_gamma = channel_gamma
-        else:
-            self.spatial_mix_k = None
-            self.spatial_mix_v = None
-            self.spatial_mix_r = None
+
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
         self.key = nn.Linear(n_embd, attn_sz, bias=False)
         self.value = nn.Linear(n_embd, attn_sz, bias=False)
@@ -208,18 +173,12 @@ class VRWKV_SpatialMix(nn.Module):
         else:
             raise NotImplementedError
 
-    def jit_func(self, x, patch_resolution):
-        # Mix x with the previous timestep to produce xk, xv, xr
-        B, T, C = x.size()
-        if self.shift_pixel > 0:
-            xx = self.shift_func(x, self.shift_pixel, self.channel_gamma, patch_resolution)
-            xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
-            xv = x * self.spatial_mix_v + xx * (1 - self.spatial_mix_v)
-            xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
-        else:
-            xk = x
-            xv = x
-            xr = x
+    def jit_func(self, x):
+
+        xx = self.time_shift(x)
+        xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
+        xv = x * self.spatial_mix_v + xx * (1 - self.spatial_mix_v)
+        xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
 
         # Use xk, xv, xr to produce k, v, r
         k = self.key(xk)
@@ -229,11 +188,11 @@ class VRWKV_SpatialMix(nn.Module):
 
         return sr, k, v
 
-    def forward(self, x, patch_resolution):
+    def forward(self, x):
         B, T, C = x.size()
-        self.device = x.device
 
-        sr, k, v = self.jit_func(x, patch_resolution)
+        sr, k, v = self.jit_func(x)
+
         rwkv = RUN_CUDA(B, T, C, self.spatial_decay / T, self.spatial_first / T, k, v)
         if self.key_norm is not None:
             rwkv = self.key_norm(rwkv)
@@ -242,23 +201,15 @@ class VRWKV_SpatialMix(nn.Module):
         return rwkv
 
 
-class VRWKV_ChannelMix(nn.Module):
-    def __init__(self, n_embd, n_layer, layer_id, shift_mode='q_shift',
-                 channel_gamma=1 / 4, shift_pixel=1, hidden_rate=4, init_mode='fancy',
+class TEMRWKV_ChannelMix(nn.Module):
+    def __init__(self, n_embd, n_layer, layer_id, hidden_rate=4, init_mode='fancy',
                  key_norm=False):
         super().__init__()
         self.layer_id = layer_id
+        self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
         self.n_layer = n_layer
         self.n_embd = n_embd
         self._init_weights(init_mode)
-        self.shift_pixel = shift_pixel
-        self.shift_mode = shift_mode
-        if shift_pixel > 0:
-            self.shift_func = eval(shift_mode)
-            self.channel_gamma = channel_gamma
-        else:
-            self.spatial_mix_k = None
-            self.spatial_mix_r = None
 
         hidden_sz = hidden_rate * n_embd
         self.key = nn.Linear(n_embd, hidden_sz, bias=False)
@@ -290,14 +241,11 @@ class VRWKV_ChannelMix(nn.Module):
         else:
             raise NotImplementedError
 
-    def forward(self, x, patch_resolution):
-        if self.shift_pixel > 0:
-            xx = self.shift_func(x, self.shift_pixel, self.channel_gamma, patch_resolution)
-            xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
-            xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
-        else:
-            xk = x
-            xr = x
+    def forward(self, x):
+
+        xx = self.time_shift(x)
+        xk = x * self.spatial_mix_k + xx * (1 - self.spatial_mix_k)
+        xr = x * self.spatial_mix_r + xx * (1 - self.spatial_mix_r)
 
         k = self.key(xk)
         k = torch.square(torch.relu(k))
@@ -310,8 +258,7 @@ class VRWKV_ChannelMix(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, n_embd, n_layer, layer_id, shift_mode='q_shift',
-                 channel_gamma=1 / 4, shift_pixel=1, hidden_rate=4,
+    def __init__(self, n_embd, n_layer, layer_id, hidden_rate=4,
                  init_mode='fancy', key_norm=False):
         super().__init__()
         self.layer_id = layer_id
@@ -320,31 +267,26 @@ class Block(nn.Module):
         if self.layer_id == 0:
             self.ln0 = nn.LayerNorm(n_embd)
 
-        self.att = VRWKV_SpatialMix(n_embd, n_layer, layer_id, shift_mode,
-                                    channel_gamma, shift_pixel, init_mode,
-                                    key_norm=key_norm)
-        self.ffn = VRWKV_ChannelMix(n_embd, n_layer, layer_id, shift_mode,
-                                    channel_gamma, shift_pixel, hidden_rate,
-                                    init_mode, key_norm=key_norm)
+        self.att = TEMRWKV_SignalMix(n_embd, n_layer, layer_id, init_mode,
+                                     key_norm=key_norm)
+        self.ffn = TEMRWKV_ChannelMix(n_embd, n_layer, layer_id, hidden_rate,
+                                      init_mode, key_norm=key_norm)
         self.gamma1 = nn.Parameter(torch.ones((n_embd)), requires_grad=True)
         self.gamma2 = nn.Parameter(torch.ones((n_embd)), requires_grad=True)
 
-    def forward(self, x, patch_resolution):
+    def forward(self, x):
         if self.layer_id == 0:
             x = self.ln0(x)
-        x = x + self.gamma1 * self.att(self.ln1(x), patch_resolution)
-        x = x + self.gamma2 * self.ffn(self.ln2(x), patch_resolution)
+        x = x + self.gamma1 * self.att(self.ln1(x))
+        x = x + self.gamma2 * self.ffn(self.ln2(x))
         return x
 
 
-class VRWKV(nn.Module):
+class TEMRWKV(nn.Module):
     def __init__(self,
                  in_channels=1,
                  embed_dims=256,
-                 depth=48,
-                 channel_gamma=1 / 4,
-                 shift_pixel=1,
-                 shift_mode='q_shift',
+                 depth=24,
                  init_mode='fancy',
                  key_norm=False,
                  hidden_rate=4):
@@ -352,8 +294,7 @@ class VRWKV(nn.Module):
         self.embed_dims = embed_dims
         self.num_layers = depth
 
-        self.patch_embed = nn.Linear(in_channels, embed_dims)
-        self.patch_resolution = (8, 8)
+        self.patch_embed = CoverEmbed(patch_size=2, in_chans=in_channels, embed_dim=embed_dims)
 
         self.layers = nn.ModuleList()
         for i in range(self.num_layers):
@@ -361,27 +302,23 @@ class VRWKV(nn.Module):
                 n_embd=embed_dims,
                 n_layer=depth,
                 layer_id=i,
-                channel_gamma=channel_gamma,
-                shift_pixel=shift_pixel,
-                shift_mode=shift_mode,
                 hidden_rate=hidden_rate,
                 init_mode=init_mode,
                 key_norm=key_norm,
             ))
-        self.fn1 = nn.Linear(embed_dims, embed_dims//2)
-        self.fn2 = nn.Linear(embed_dims//2, 2)
+        self.fn1 = nn.Linear(embed_dims, embed_dims // 2)
+        self.fn2 = nn.Linear(embed_dims // 2, 2)
 
     def forward(self, x):
         x = self.patch_embed(x)
         for i, layer in enumerate(self.layers):
-            x = layer(x, self.patch_resolution)
+            x = layer(x, )
         return self.fn2(self.fn1(x))
 
 
 if __name__ == "__main__":
-
-    x = torch.zeros((1, 64, 1)).type(torch.FloatTensor).cuda()
-    model = VRWKV()
+    x = torch.zeros((1, 8, 1)).type(torch.FloatTensor).cuda()
+    model = TEMRWKV()
     model.cuda()
     y = model(x)
     print(y)

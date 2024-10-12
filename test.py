@@ -28,5 +28,7 @@ def pre(noise_data):
 
 if __name__ == '__main__':
     n = np.load('test/noise.npy')
-    clean = pre(n)
-    np.save('test/clean.npy', clean.cpu().numpy())
+    pre_data = pre(n)
+    pre_noise = pre_data[:, :, 1:2].cpu().numpy()
+    clean = n - pre_noise[0, :, 0]
+    np.save('test/clean.npy', clean)
